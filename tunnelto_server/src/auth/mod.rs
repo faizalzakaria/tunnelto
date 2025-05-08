@@ -61,6 +61,8 @@ pub trait AuthService {
         auth_key: &Self::AuthKey,
         subdomain: &str,
     ) -> Result<AuthResult, Self::Error>;
+
+    async fn auth_key(&self, _key_from_client: &str) -> Result<Self::AuthKey, Self::Error>;
 }
 
 /// A result for authenticating a subdomain
@@ -79,6 +81,10 @@ pub struct NoAuth;
 impl AuthService for NoAuth {
     type Error = ();
     type AuthKey = ();
+
+    async fn auth_key(&self, _key_from_client: &str) -> Result<Self::AuthKey, Self::Error> {
+        Ok(())
+    }
 
     /// Authenticate a subdomain with an AuthKey
     async fn auth_sub_domain(

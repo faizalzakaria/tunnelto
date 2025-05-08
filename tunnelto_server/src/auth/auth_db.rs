@@ -70,9 +70,16 @@ impl AuthService for AuthDbService {
     type Error = Error;
     type AuthKey = String;
 
+    async fn auth_key(&self, key_from_client: &str) -> Result<Self::AuthKey, Self::Error> {
+        match self.get_account_id_for_auth_key(key_from_client).await {
+            Ok(_account_id) => Ok(key_from_client.to_string()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn auth_sub_domain(
         &self,
-        auth_key: &String,
+        auth_key: &Self::AuthKey,
         subdomain: &str,
     ) -> Result<AuthResult, Error> {
         let authenticated_account_id = self.get_account_id_for_auth_key(auth_key).await?;

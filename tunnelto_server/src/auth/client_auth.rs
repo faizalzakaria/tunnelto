@@ -43,76 +43,77 @@ async fn auth_client(
         }
     };
 
-    let (auth_key, client_id, requested_sub_domain) = match client_hello.client_type {
+    let (key_to_use_for_subdomain_auth, client_id_for_handshake, actual_requested_sub_domain) = match client_hello.client_type {
         ClientType::Anonymous => {
+            // Original logic for Anonymous: send AuthFailed and return.
+            // Reconnect tokens for anonymous clients are handled if ClientHello has a token
+            // and ClientType is Auth { key: _ } but sub_domain is None (see below) or
+            // if a dedicated path for Anonymous + Token existed (which it doesn't directly here).
+            // If a client sends ClientType::Anonymous, it's typically expecting a random domain or an error.
+            if let Some(token) = client_hello.reconnect_token {
+                // If an anonymous client sends a reconnect token, handle it.
+                return handle_reconnect_token(token, websocket).await;
+            }
+            error!("Client sent ClientType::Anonymous without a reconnect token. This path usually expects an API key or a token.");
             let data = serde_json::to_vec(&ServerHello::AuthFailed).unwrap_or_default();
             let _ = websocket.send(Message::binary(data)).await;
             return None;
-
-            // // determine the client and subdomain
-            // let (client_id, sub_domain) =
-            //     match (client_hello.reconnect_token, client_hello.sub_domain) {
-            //         (Some(token), _) => {
-            //             return handle_reconnect_token(token, websocket).await;
-            //         }
-            //         (None, Some(sd)) => (
-            //             ClientId::generate(),
-            //             ServerHello::prefixed_random_domain(&sd),
-            //         ),
-            //         (None, None) => (ClientId::generate(), ServerHello::random_domain()),
-            //     };
-
-            // return Some((
-            //     websocket,
-            //     ClientHandshake {
-            //         id: client_id,
-            //         sub_domain,
-            //         is_anonymous: true,
-            //     },
-            // ));
         }
-        ClientType::Auth { key } => match client_hello.sub_domain {
-            Some(requested_sub_domain) => {
-                let client_id = key.client_id();
-                let (ws, sub_domain) = match sanitize_sub_domain_and_pre_validate(
-                    websocket,
-                    requested_sub_domain,
-                    &client_id,
-                )
-                .await
-                {
-                    Some(s) => s,
-                    None => return None,
-                };
-                websocket = ws;
+        ClientType::Auth { key } => { // `key` here is tunnelto_lib::AuthKey (String wrapper)
+            let raw_api_key_string = &key.0;
 
-                (key, client_id, sub_domain)
-            }
-            None => {
-                if let Some(token) = client_hello.reconnect_token {
-                    return handle_reconnect_token(token, websocket).await;
-                } else {
-                    let sub_domain = ServerHello::random_domain();
-                    let client_id = key.client_id();
-                    (key, client_id, sub_domain)
+            // 1. Process the raw API key string using the active AuthService's `auth_key` method.
+            let processed_key = match crate::AUTH_DB_SERVICE.auth_key(raw_api_key_string).await {
+                Ok(pk) => pk, // pk is now of type `AUTH_DB_SERVICE::AuthKey` (String or ())
+                Err(_) => {
+                    error!(apiKey=%raw_api_key_string, "API key rejected by AUTH_DB_SERVICE.auth_key");
+                    let data = serde_json::to_vec(&ServerHello::AuthFailed).unwrap_or_default();
+                    let _ = websocket.send(Message::binary(data)).await;
+                    return None;
+                }
+            };
+
+            let client_id_val = key.client_id(); // Use original key for consistent client_id derivation
+
+            match client_hello.sub_domain {
+                Some(requested_sub_domain_str) => {
+                    let (ws, final_sub_domain_str) = match sanitize_sub_domain_and_pre_validate(
+                        websocket,
+                        requested_sub_domain_str,
+                        &client_id_val, // Pass client_id derived from original key
+                    )
+                    .await {
+                        Some(s) => s,
+                        None => return None, // sanitize_sub_domain_and_pre_validate sends error response
+                    };
+                    websocket = ws;
+                    (processed_key, client_id_val, final_sub_domain_str)
+                }
+                None => { // No specific subdomain requested with API key
+                    if let Some(token) = client_hello.reconnect_token {
+                        // API key was provided, but also a reconnect token, and no specific subdomain.
+                        // Prioritize reconnect token.
+                        return handle_reconnect_token(token, websocket).await;
+                    }
+                    // Only API key, no subdomain, no token: assign a random one.
+                    let final_sub_domain_str = ServerHello::random_domain();
+                    (processed_key, client_id_val, final_sub_domain_str)
                 }
             }
-        },
+        }
     };
 
-    tracing::info!(requested_sub_domain=%requested_sub_domain, "will auth sub domain");
+    tracing::info!(requested_sub_domain=%actual_requested_sub_domain, "will auth sub domain");
 
     // next authenticate the sub-domain
-    let sub_domain = match crate::AUTH_DB_SERVICE
-        .auth_sub_domain(&auth_key.0, &requested_sub_domain)
+    // Pass `&key_to_use_for_subdomain_auth` which is now correctly typed (String for AuthDb, () for NoAuth).
+    let sub_domain_after_auth = match crate::AUTH_DB_SERVICE
+        .auth_sub_domain(&key_to_use_for_subdomain_auth, &actual_requested_sub_domain)
         .await
     {
-        Ok(AuthResult::Available) | Ok(AuthResult::ReservedByYou) => requested_sub_domain,
+        Ok(AuthResult::Available) | Ok(AuthResult::ReservedByYou) => actual_requested_sub_domain,
         Ok(AuthResult::ReservedByYouButDelinquent) | Ok(AuthResult::PaymentRequired) => {
-            // note: delinquent payments get a random suffix
-            // ServerHello::prefixed_random_domain(&requested_sub_domain)
-            // TODO: create free trial domain
-            tracing::info!(requested_sub_domain=%requested_sub_domain, "payment required");
+            tracing::info!(requested_sub_domain=%actual_requested_sub_domain, "payment required or delinquent");
             let data = serde_json::to_vec(&ServerHello::AuthFailed).unwrap_or_default();
             let _ = websocket.send(Message::binary(data)).await;
             return None;
@@ -130,14 +131,14 @@ async fn auth_client(
         }
     };
 
-    tracing::info!(subdomain=%sub_domain, "did auth sub_domain");
+    tracing::info!(subdomain=%sub_domain_after_auth, "did auth sub_domain");
 
     Some((
         websocket,
         ClientHandshake {
-            id: client_id,
-            sub_domain,
-            is_anonymous: false,
+            id: client_id_for_handshake, 
+            sub_domain: sub_domain_after_auth, 
+            is_anonymous: false, // For ClientType::Auth path, or successful reconnect which sets its own is_anonymous
         },
     ))
 }
@@ -177,7 +178,6 @@ async fn sanitize_sub_domain_and_pre_validate(
     requested_sub_domain: String,
     client_id: &ClientId,
 ) -> Option<(WebSocket, String)> {
-    // ignore uppercase
     let sub_domain = requested_sub_domain.to_lowercase();
 
     if sub_domain
@@ -192,7 +192,6 @@ async fn sanitize_sub_domain_and_pre_validate(
         return None;
     }
 
-    // ensure it's not a restricted one
     if CONFIG.blocked_sub_domains.contains(&sub_domain) {
         error!("invalid client hello: sub-domain restrict!");
         let data = serde_json::to_vec(&ServerHello::SubDomainInUse).unwrap_or_default();
@@ -200,8 +199,6 @@ async fn sanitize_sub_domain_and_pre_validate(
         return None;
     }
 
-    // ensure this sub-domain isn't taken
-    // check all instances
     match crate::network::instance_for_host(&sub_domain).await {
         Err(crate::network::Error::DoesNotServeHost) => {}
         Ok((_, existing_client)) => {
